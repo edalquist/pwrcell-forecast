@@ -1,21 +1,30 @@
 from __future__ import annotations
-
-from typing import Optional
-from isodate import parse_datetime, parse_duration
 from absl import app
 from absl import flags
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, time
+from isodate import parse_datetime, parse_duration
+from pathlib import Path
+from typing import Optional
 import isodate
 import json
+import requests
 import tzlocal
+
 
 FLAGS = flags.FLAGS
 
 ONE_HOUR = timedelta(hours=1)
+SOLCAST_URL_TEMPLATE = "https://api.solcast.com.au/rooftop_sites/{site_id}/forecasts?format=json&api_key={api_key}"
 
-flags.DEFINE_multi_string(
+flags.DEFINE_list(
   "files", None, "List of files to use instead of fetching")
+
+flags.DEFINE_list(
+  "solcast_sites", None, "List of solcast.com.au site IDs to get forecast data from")
+flags.DEFINE_string("solcast_apikey", None, "solcast.com.au API Key")
+
+flags.DEFINE_string("ha.apikey", None, "Home Assistant API Key")
 
 flags.DEFINE_float("battery_capacity", 17.1, "KWh")
 flags.DEFINE_float("inverter_capacity_dc", 8.3, "KW")
@@ -135,11 +144,34 @@ def get_charge_plan(df: DailyForecast) -> ForecastResult:
 
 def main(argv):
   print("Files: ", FLAGS.files)
+  print("Solcast Sites: ", FLAGS.solcast_sites)
+  print("Solcast API Key: ", FLAGS.solcast_apikey)
 
   forecast_json = []
   if FLAGS.files:
     for f in FLAGS.files:
       forecast_json.append(read_to_json(f))
+  elif FLAGS.solcast_sites and FLAGS.solcast_apikey:
+    cache_dir = Path('.') / 'cache'
+    cache_dir.mkdir(exist_ok=True, parents=True)
+    for s in FLAGS.solcast_sites:
+      now = datetime.now()
+      now = datetime(now.year, now.month, now.day, now.hour)
+      cache_file = cache_dir / f'{now.strftime("%Y%m%d%H")}_{s}.json'
+      if cache_file.exists():
+        print(f'Reading from cache {cache_file}')
+        forecast_json.append(read_to_json(cache_file))
+      else:
+        print(f'Fetching new forecast into {cache_file}')
+        with cache_file.open('w') as f:
+          api_url = SOLCAST_URL_TEMPLATE.format(site_id=s, api_key=FLAGS.solcast_apikey)
+          resp = requests.get(api_url)
+          if resp.status_code != 200:
+            print(f'Failed to fetch {api_url}: {resp.status_code}')
+            print(resp.text)
+            return
+          f.write(resp.text)
+          forecast_json.append(resp.json())
   else:
     print("Files must be specified")
     return
@@ -149,6 +181,16 @@ def main(argv):
   for df in forecasts.values():
     fr = get_charge_plan(df)
     print(fr)
+
+# curl -X POST \
+#   https://ha.home.dalquist.org/api/services/input_number/set_value \
+#   -H 'Authorization: Bearer XXX' \
+#   -d '{"entity_id": "input_number.pwrcell_forecast_discharge_target", "value": 25}'
+
+# curl -X POST \
+#   https://ha.home.dalquist.org/api/services/input_datetime/set_datetime \
+#   -H 'Authorization: Bearer XXX' \
+#   -d '{"entity_id": "input_datetime.pwrcell_forecast_discharge_start", "datetime": "2023-06-06 10:31:00"}'
 
 
 if __name__ == '__main__':
