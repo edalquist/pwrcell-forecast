@@ -10,12 +10,15 @@ import isodate
 import json
 import requests
 import tzlocal
-
+from math import floor
+import logging
+import sys
 
 FLAGS = flags.FLAGS
 
 ONE_HOUR = timedelta(hours=1)
 SOLCAST_URL_TEMPLATE = "https://api.solcast.com.au/rooftop_sites/{site_id}/forecasts?format=json&api_key={api_key}"
+HA_DATETIME = '%Y-%m-%d %H:%M:%S'
 
 flags.DEFINE_list(
   "files", None, "List of files to use instead of fetching")
@@ -24,7 +27,8 @@ flags.DEFINE_list(
   "solcast_sites", None, "List of solcast.com.au site IDs to get forecast data from")
 flags.DEFINE_string("solcast_apikey", None, "solcast.com.au API Key")
 
-flags.DEFINE_string("ha.apikey", None, "Home Assistant API Key")
+flags.DEFINE_string("ha_url", None, "Home Assistant Base URL")
+flags.DEFINE_string("ha_apikey", None, "Home Assistant API Key")
 
 flags.DEFINE_float("battery_capacity", 17.1, "KWh")
 flags.DEFINE_float("inverter_capacity_dc", 8.3, "KW")
@@ -34,12 +38,39 @@ flags.DEFINE_float("target_max", 95.0, "%")
 flags.DEFINE_float("min_reserve", 10.0, "%")
 
 
+root = logging.getLogger()
+root.setLevel(logging.DEBUG)
+
+handler = logging.StreamHandler(sys.stderr)
+handler.setLevel(logging.DEBUG)
+formatter = logging.Formatter(
+  '%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+handler.setFormatter(formatter)
+root.addHandler(handler)
+
+requests_log = logging.getLogger("requests.packages.urllib3")
+requests_log.setLevel(logging.DEBUG)
+requests_log.propagate = True
+
+
+# These two lines enable debugging at httplib level (requests->urllib3->http.client)
+# You will see the REQUEST, including HEADERS and DATA, and RESPONSE with HEADERS but without DATA.
+# The only thing missing will be the response.body which is not logged.
+# try:
+#   import http.client as http_client
+# except ImportError:
+#   # Python 2
+#   import httplib as http_client
+# http_client.HTTPConnection.debuglevel = 1
+
+
 @dataclass
 class ForecastResult:
-  discharge_start_time: time
+  expected_excess: float
+  discharge_start_time: datetime
   discharge_target: float
-  target_reserve_time: time
-  clean_backup_time: time
+  target_reserve_time: datetime
+  clean_backup_time: datetime
 
 
 @dataclass
@@ -116,30 +147,59 @@ def merge_forecasts(forecasts: list) -> dict[date, DailyForecast]:
 
 def get_charge_plan(df: DailyForecast) -> ForecastResult:
   excess_kwh = df.p90_excess_kwh()
+  if not excess_kwh:
+    return ForecastResult(0, None, None, None, None)
+
   target_min = max(FLAGS.min_reserve, FLAGS.target_max -
                    ((excess_kwh / FLAGS.battery_capacity) * 100))
 
-  discharge_start_time: Optional[time] = None
+  discharge_start_time: Optional[datetime] = None
   first_excess: Optional[int] = None
-  target_max_time: Optional[time] = None
-  clean_backup_time: Optional[time] = None
+  target_max_time: Optional[datetime] = None
+  clean_backup_time: Optional[datetime] = None
 
   for idx, fp in enumerate(df.periods.values()):
     if not first_excess and fp.p90_excess_kwh() > 0:
       first_excess = idx
-      target_max_time = fp.period_end.time()
+      target_max_time = fp.period_end
     elif first_excess and fp.p90_excess_kwh() == 0:
-      clean_backup_time = fp.period_end.time()
+      clean_backup_time = fp.period_end
       break
 
   for fp in reversed(list(df.periods.values())[:first_excess]):
     excess_kwh -= fp.p90_avail_kwh()
     if excess_kwh <= 0:
-      discharge_start_time = fp.period_end.time()
+      discharge_start_time = fp.period_end
       break
 
-  return ForecastResult(discharge_start_time, target_min,
+  return ForecastResult(df.p90_excess_kwh(), discharge_start_time, target_min,
                         target_max_time, clean_backup_time)
+
+
+def update_ha(url: str, data: dict) -> requests.Response:
+  return requests.post(url,
+                       headers={'Authorization': f'Bearer {FLAGS.ha_apikey}'},
+                       data=json.dumps(data))
+
+
+def update_ha_datetime(entity_id: str, dt: datetime) -> None:
+  resp = update_ha(f'{FLAGS.ha_url}/api/services/input_datetime/set_datetime',
+                   data={
+                       'entity_id': f'input_datetime.{entity_id}',
+                       'datetime': dt.strftime(HA_DATETIME)
+                   })
+  if resp.status_code != 200:
+    print(f'Error updating {entity_id} to {dt}: {resp}')
+
+
+def update_ha_number(entity_id: str, val: float) -> None:
+  resp = update_ha(f'{FLAGS.ha_url}/api/services/input_number/set_value',
+                   data={
+                       'entity_id': f'input_number.{entity_id}',
+                       'value': val
+                   })
+  if resp.status_code != 200:
+    print(f'Error updating {entity_id} to {val}: {resp}')
 
 
 def main(argv):
@@ -156,7 +216,7 @@ def main(argv):
     cache_dir.mkdir(exist_ok=True, parents=True)
     for s in FLAGS.solcast_sites:
       now = datetime.now()
-      now = datetime(now.year, now.month, now.day, now.hour)
+      now = datetime(now.year, now.month, now.day, floor(now.hour / 4) * 4)
       cache_file = cache_dir / f'{now.strftime("%Y%m%d%H")}_{s}.json'
       if cache_file.exists():
         print(f'Reading from cache {cache_file}')
@@ -164,7 +224,8 @@ def main(argv):
       else:
         print(f'Fetching new forecast into {cache_file}')
         with cache_file.open('w') as f:
-          api_url = SOLCAST_URL_TEMPLATE.format(site_id=s, api_key=FLAGS.solcast_apikey)
+          api_url = SOLCAST_URL_TEMPLATE.format(
+            site_id=s, api_key=FLAGS.solcast_apikey)
           resp = requests.get(api_url)
           if resp.status_code != 200:
             print(f'Failed to fetch {api_url}: {resp.status_code}')
@@ -178,19 +239,23 @@ def main(argv):
 
   forecasts = merge_forecasts(forecast_json)
 
-  for df in forecasts.values():
+  updated_ha: bool = False
+  for df in sorted(forecasts.values(), key=lambda df: df.period_date):
     fr = get_charge_plan(df)
-    print(fr)
-
-# curl -X POST \
-#   https://ha.home.dalquist.org/api/services/input_number/set_value \
-#   -H 'Authorization: Bearer XXX' \
-#   -d '{"entity_id": "input_number.pwrcell_forecast_discharge_target", "value": 25}'
-
-# curl -X POST \
-#   https://ha.home.dalquist.org/api/services/input_datetime/set_datetime \
-#   -H 'Authorization: Bearer XXX' \
-#   -d '{"entity_id": "input_datetime.pwrcell_forecast_discharge_start", "datetime": "2023-06-06 10:31:00"}'
+    print(df.period_date, fr)
+    if fr.expected_excess and not updated_ha:
+      updated_ha = True
+      print("UPDATE HA")
+      update_ha_datetime('pwrcell_forecast_discharge_start',
+                         fr.discharge_start_time)
+      update_ha_datetime('pwrcell_forecast_max_reserve_start',
+                         fr.target_reserve_time)
+      update_ha_datetime(
+        'pwrcell_forecast_clean_backup_start', fr.clean_backup_time)
+      update_ha_number('pwrcell_forecast_discharge_target',
+                       round(fr.discharge_target))
+      update_ha_number('pwrcell_forecast_max_reserve_target',
+                       round(FLAGS.target_max))
 
 
 if __name__ == '__main__':
