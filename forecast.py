@@ -34,7 +34,7 @@ flags.DEFINE_float("battery_capacity", 17.1, "KWh")
 flags.DEFINE_float("inverter_capacity_dc", 8.3, "KW")
 flags.DEFINE_float("battery_efficiency", 96.0, "%")
 flags.DEFINE_float("target_reserve", 85.0, "%")
-flags.DEFINE_float("target_max", 95.0, "%")
+flags.DEFINE_float("target_max", 90.0, "%")
 flags.DEFINE_float("min_reserve", 10.0, "%")
 
 
@@ -150,8 +150,8 @@ def get_charge_plan(df: DailyForecast) -> ForecastResult:
   if not excess_kwh:
     return ForecastResult(0, None, None, None, None)
 
-  target_min = max(FLAGS.min_reserve, FLAGS.target_max -
-                   ((excess_kwh / FLAGS.battery_capacity) * 100))
+  target_min = floor(max(FLAGS.min_reserve, FLAGS.target_max -
+                   ((excess_kwh / FLAGS.battery_capacity) * 100)))
 
   discharge_start_time: Optional[datetime] = None
   first_excess: Optional[int] = None
@@ -201,6 +201,19 @@ def update_ha_number(entity_id: str, val: float) -> None:
   if resp.status_code != 200:
     print(f'Error updating {entity_id} to {val}: {resp}')
 
+def print_forecast(df: DailyForecast, fr: ForecastResult) -> None:
+  print(f'Forecast for: {df.period_date.strftime("%Y-%m-%d")}')
+  excess_sum: float = 0
+  for p in df.periods.values():
+    if p.p90_kw:
+      excess_sum += p.p90_excess_kwh()
+      print(f'  {p.period_end.strftime("%Y-%m-%d %H:%M")}, {p.p90_kw:.2f}KW, {p.p90_kwh():.2f}KWh, {p.p90_excess_kwh():.2f}KWh/{excess_sum:.2f}KWh excess')
+  print((f'Expected {fr.expected_excess:.2f}KWh excess, '
+         f'discharge at {fr.discharge_start_time.strftime("%H:%M")} to {fr.discharge_target:.0f}%, '
+         f'reset reserve at {fr.target_reserve_time.strftime("%H:%M")} to {FLAGS.target_max:.0f}%, '
+         f'start clean backup at {fr.clean_backup_time.strftime("%H:%M")}'
+  ))
+
 
 def main(argv):
   print("Files: ", FLAGS.files)
@@ -239,13 +252,10 @@ def main(argv):
 
   forecasts = merge_forecasts(forecast_json)
 
-  updated_ha: bool = False
   for df in sorted(forecasts.values(), key=lambda df: df.period_date):
     fr = get_charge_plan(df)
-    print(df.period_date, fr)
-    if fr.expected_excess and not updated_ha:
-      updated_ha = True
-      print("UPDATE HA")
+    if fr.expected_excess:
+      print_forecast(df, fr)
       update_ha_datetime('pwrcell_forecast_discharge_start',
                          fr.discharge_start_time)
       update_ha_datetime('pwrcell_forecast_max_reserve_start',
@@ -256,6 +266,7 @@ def main(argv):
                        round(fr.discharge_target))
       update_ha_number('pwrcell_forecast_max_reserve_target',
                        round(FLAGS.target_max))
+      break
 
 
 if __name__ == '__main__':
