@@ -36,6 +36,7 @@ flags.DEFINE_float("battery_efficiency", 96.0, "%")
 flags.DEFINE_float("target_reserve", 85.0, "%")
 flags.DEFINE_float("target_max", 90.0, "%")
 flags.DEFINE_float("min_reserve", 10.0, "%")
+flags.DEFINE_float("charge_buffer", 10.0, "%")
 
 
 root = logging.getLogger()
@@ -150,8 +151,8 @@ def get_charge_plan(df: DailyForecast) -> ForecastResult:
   if not excess_kwh:
     return ForecastResult(0, None, None, None, None)
 
-  target_min = floor(max(FLAGS.min_reserve, FLAGS.target_max -
-                   ((excess_kwh / FLAGS.battery_capacity) * 100)))
+  excess_pct = floor((excess_kwh / FLAGS.battery_capacity) * 100)
+  target_min = max(FLAGS.min_reserve, FLAGS.target_max - excess_pct - FLAGS.charge_buffer)
 
   discharge_start_time: Optional[datetime] = None
   first_excess: Optional[int] = None
