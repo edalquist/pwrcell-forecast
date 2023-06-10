@@ -32,8 +32,7 @@ flags.DEFINE_string("ha_apikey", None, "Home Assistant API Key")
 
 flags.DEFINE_float("battery_capacity", 17.1, "KWh")
 flags.DEFINE_float("inverter_capacity_dc", 8.3, "KW")
-flags.DEFINE_float("battery_efficiency", 96.0, "%")
-flags.DEFINE_float("target_reserve", 85.0, "%")
+flags.DEFINE_float("target_reserve", 90.0, "%")
 flags.DEFINE_float("target_max", 90.0, "%")
 flags.DEFINE_float("min_reserve", 10.0, "%")
 flags.DEFINE_float("charge_buffer", 10.0, "%")
@@ -255,18 +254,21 @@ def main(argv):
 
   for df in sorted(forecasts.values(), key=lambda df: df.period_date):
     fr = get_charge_plan(df)
-    if fr.expected_excess:
+    if not fr.expected_excess:
+      print(f'Forecast for: {df.period_date.strftime("%Y-%m-%d")} has no excess generation')
+    else:
       print_forecast(df, fr)
-      update_ha_datetime('pwrcell_forecast_discharge_start',
-                         fr.discharge_start_time)
-      update_ha_datetime('pwrcell_forecast_max_reserve_start',
-                         fr.target_reserve_time)
-      update_ha_datetime(
-        'pwrcell_forecast_clean_backup_start', fr.clean_backup_time)
-      update_ha_number('pwrcell_forecast_discharge_target',
-                       round(fr.discharge_target))
-      update_ha_number('pwrcell_forecast_max_reserve_target',
-                       round(FLAGS.target_max))
+      if FLAGS.ha_url:
+        update_ha_datetime('pwrcell_forecast_discharge_start',
+                          fr.discharge_start_time)
+        update_ha_datetime('pwrcell_forecast_max_reserve_start',
+                          fr.target_reserve_time)
+        update_ha_datetime(
+          'pwrcell_forecast_clean_backup_start', fr.clean_backup_time)
+        update_ha_number('pwrcell_forecast_discharge_target',
+                        round(fr.discharge_target))
+        update_ha_number('pwrcell_forecast_max_reserve_target',
+                        round(FLAGS.target_max))
       break
 
 
