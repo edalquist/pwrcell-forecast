@@ -63,9 +63,6 @@ forecast.py:
   --target_max: %
     (default: '90.0')
     (a number)
-  --target_reserve: %
-    (default: '90.0')
-    (a number)
 ```
 
 ## 3. (Optional) Setup Home Assistant

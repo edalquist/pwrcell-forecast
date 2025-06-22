@@ -32,7 +32,6 @@ flags.DEFINE_string("ha_apikey", None, "Home Assistant API Key")
 
 flags.DEFINE_float("battery_capacity", 17.1, "KWh")
 flags.DEFINE_float("inverter_capacity_dc", 8.3, "KW")
-flags.DEFINE_float("target_reserve", 90.0, "%")
 flags.DEFINE_float("target_max", 90.0, "%")
 flags.DEFINE_float("min_reserve", 10.0, "%")
 flags.DEFINE_float("charge_buffer", 10.0, "%")
@@ -150,30 +149,58 @@ def get_charge_plan(df: DailyForecast) -> ForecastResult:
   if not excess_kwh:
     return ForecastResult(0, None, None, None, None)
 
-  excess_pct = floor((excess_kwh / FLAGS.battery_capacity) * 100)
-  target_min = max(FLAGS.min_reserve, FLAGS.target_max - excess_pct - FLAGS.charge_buffer)
+  # Determine the target state of charge to discharge to.
+  # We want to end up at target_max after charging the excess, minus a buffer.
+  excess_pct = (excess_kwh / FLAGS.battery_capacity) * 100
+
+  # The target minimum charge level we need to reach before the sun comes up.
+  # This is capped by the absolute min_reserve.
+  target_discharge_pct = max(
+      FLAGS.min_reserve, FLAGS.target_max - excess_pct - FLAGS.charge_buffer)
+
+  # Amount of energy to discharge from the battery to reach the target.
+  # Assumes we start at target_max.
+  kwh_to_discharge = ((FLAGS.target_max - target_discharge_pct) / 100.0) * \
+      FLAGS.battery_capacity
 
   discharge_start_time: Optional[datetime] = None
-  first_excess: Optional[int] = None
-  target_max_time: Optional[datetime] = None
+  first_excess_idx: Optional[int] = None
+  target_reserve_time: Optional[datetime] = None
   clean_backup_time: Optional[datetime] = None
 
-  for idx, fp in enumerate(df.periods.values()):
-    if not first_excess and fp.p90_excess_kwh() > 0:
-      first_excess = idx
-      target_max_time = fp.period_end
-    elif first_excess and fp.p90_excess_kwh() == 0:
+  sorted_periods = sorted(df.periods.values(), key=lambda p: p.period_end)
+
+  for idx, fp in enumerate(sorted_periods):
+    if first_excess_idx is None and fp.p90_excess_kwh() > 0:
+      first_excess_idx = idx
+      target_reserve_time = fp.period_end
+    elif first_excess_idx is not None and fp.p90_excess_kwh() == 0:
+      # This is the first period *after* the excess block ends.
       clean_backup_time = fp.period_end
       break
 
-  for fp in reversed(list(df.periods.values())[:first_excess]):
-    excess_kwh -= fp.p90_avail_kwh()
-    if excess_kwh <= 0:
-      discharge_start_time = fp.period_end
+  if first_excess_idx is None:
+    # This should not be reached due to the early return, but is a safeguard.
+    return ForecastResult(excess_kwh, None, target_discharge_pct, None, None)
+
+  # Work backwards from when excess starts, to see when we need to start
+  # discharging.
+  kwh_discharged = 0
+  # Look at periods before the first excess period.
+  for fp in reversed(sorted_periods[:first_excess_idx]):
+    # p90_avail_kwh is the inverter capacity not used by solar, so it's
+    # available for battery discharge.
+    kwh_discharged += fp.p90_avail_kwh()
+    if kwh_discharged >= kwh_to_discharge:
+      discharge_start_time = fp.period_end - fp.period  # Start of the period
       break
 
-  return ForecastResult(df.p90_excess_kwh(), discharge_start_time, target_min,
-                        target_max_time, clean_backup_time)
+  now = datetime.now(tz=tzlocal.get_localzone())
+  if discharge_start_time and discharge_start_time < now:
+    discharge_start_time = now + timedelta(minutes=5)
+
+  return ForecastResult(excess_kwh, discharge_start_time, target_discharge_pct,
+                        target_reserve_time, clean_backup_time)
 
 
 def update_ha(url: str, data: dict) -> requests.Response:
@@ -204,15 +231,23 @@ def update_ha_number(entity_id: str, val: float) -> None:
 def print_forecast(df: DailyForecast, fr: ForecastResult) -> None:
   print(f'Forecast for: {df.period_date.strftime("%Y-%m-%d")}')
   excess_sum: float = 0
-  for p in df.periods.values():
+  sorted_periods = sorted(df.periods.values(), key=lambda p: p.period_end)
+  for p in sorted_periods:
     if p.p90_kw:
       excess_sum += p.p90_excess_kwh()
-      print(f'  {p.period_end.strftime("%Y-%m-%d %H:%M")}, {p.p90_kw:.2f}KW, {p.p90_kwh():.2f}KWh, {p.p90_excess_kwh():.2f}KWh/{excess_sum:.2f}KWh excess')
+      print(
+          f'  {p.period_end.strftime("%Y-%m-%d %H:%M")}, {p.p90_kw:.2f}KW, '
+          f'{p.p90_kwh():.2f}KWh, {p.p90_excess_kwh():.2f}KWh/{excess_sum:.2f}KWh excess'
+      )
+
+  def time_str(dt: Optional[datetime]) -> str:
+    return dt.strftime("%H:%M") if dt else "N/A"
+
   print((f'Expected {fr.expected_excess:.2f}KWh excess, '
-         f'discharge at {fr.discharge_start_time.strftime("%H:%M")} to {fr.discharge_target:.0f}%, '
-         f'reset reserve at {fr.target_reserve_time.strftime("%H:%M")} to {FLAGS.target_max:.0f}%, '
-         f'start clean backup at {fr.clean_backup_time.strftime("%H:%M")}'
-  ))
+         f'discharge at {time_str(fr.discharge_start_time)} to {fr.discharge_target:.0f}%, '
+         f'reset reserve at {time_str(fr.target_reserve_time)} to {FLAGS.target_max:.0f}%, '
+         f'start clean backup at {time_str(fr.clean_backup_time)}'
+         ))
 
 
 def main(argv):
@@ -259,16 +294,20 @@ def main(argv):
     else:
       print_forecast(df, fr)
       if FLAGS.ha_url:
-        update_ha_datetime('pwrcell_forecast_discharge_start',
-                          fr.discharge_start_time)
-        update_ha_datetime('pwrcell_forecast_max_reserve_start',
-                          fr.target_reserve_time)
-        update_ha_datetime(
-          'pwrcell_forecast_clean_backup_start', fr.clean_backup_time)
-        update_ha_number('pwrcell_forecast_discharge_target',
-                        round(fr.discharge_target))
-        update_ha_number('pwrcell_forecast_max_reserve_target',
-                        round(FLAGS.target_max))
+        if (fr.discharge_start_time and fr.target_reserve_time and
+            fr.clean_backup_time and fr.discharge_target is not None):
+          update_ha_datetime('pwrcell_forecast_discharge_start',
+                             fr.discharge_start_time)
+          update_ha_datetime('pwrcell_forecast_max_reserve_start',
+                             fr.target_reserve_time)
+          update_ha_datetime(
+              'pwrcell_forecast_clean_backup_start', fr.clean_backup_time)
+          update_ha_number('pwrcell_forecast_discharge_target',
+                           round(fr.discharge_target))
+          update_ha_number('pwrcell_forecast_max_reserve_target',
+                           round(FLAGS.target_max))
+        else:
+          print("Partial forecast result, not updating Home Assistant.")
       break
 
 
